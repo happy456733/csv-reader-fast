@@ -38,7 +38,7 @@ export function run(input) {
   // leading pieces, e.g. the literal opening quote of an unterminated field).
   // Returns {value, endKind} with endKind 0 = comma, 1 = record end, 2 = EOF.
   // Advances the shared cursor i and line counter.
-  function parseUnquoted(p0, parts0, rowForErr) {
+  function parseUnquoted(p0, parts0, rowForErr, startLine) {
     let p = p0;
     let parts = parts0;
     for (;;) {
@@ -53,37 +53,111 @@ export function run(input) {
         end = lf;
         kind = 1;
       }
-      const cr = text.indexOf('\r', p);
-      if (cr !== -1 && (end === -1 || cr < end)) {
-        if (kind === 1 && cr === end - 1) {
-          // CRLF: the field ends at the CR and the record ends.
-          const value = parts === null ? text.slice(p, cr) : parts.join('') + text.slice(p, cr);
+      if (kind === 1 && end > p && text.charCodeAt(end - 1) === 13) {
+        // CRLF ending: the value is the slice without the CR, unless a stray
+        // CR hides inside it.
+        const v = text.slice(p, end - 1);
+        if (v.indexOf('\r') === -1) {
           i = end + 1;
           line++;
-          return { value, endKind: 1 };
+          return { value: parts === null ? v : parts.join('') + v, endKind: 1 };
         }
-        // Stray CR: dropped, error, and the field continues past it.
-        errors.push({ code: 'stray_cr', line, row: rowForErr });
-        if (parts === null) parts = [text.slice(p, cr)];
-        else parts.push(text.slice(p, cr));
-        p = cr + 1;
-        continue;
+      } else if (kind !== 2) {
+        const v = text.slice(p, end);
+        if (v.indexOf('\r') === -1) {
+          i = end + 1;
+          if (kind === 1) line++;
+          return { value: parts === null ? v : parts.join('') + v, endKind: kind };
+        }
+      } else {
+        const v = text.slice(p);
+        if (v.indexOf('\r') === -1) {
+          i = n;
+          return { value: parts === null ? v : parts.join('') + v, endKind: 2 };
+        }
       }
-      if (kind === 2) {
-        const value = parts === null ? text.slice(p) : parts.join('') + text.slice(p);
-        i = n;
-        return { value, endKind: 2 };
-      }
-      if (kind === 0) {
-        const value = parts === null ? text.slice(p, end) : parts.join('') + text.slice(p, end);
-        i = end + 1;
-        return { value, endKind: 0 };
-      }
-      const value = parts === null ? text.slice(p, end) : parts.join('') + text.slice(p, end);
-      i = end + 1;
-      line++;
-      return { value, endKind: 1 };
+      // Slow path: a stray CR sits inside the field. Drop it, report it, and
+      // keep reading the same field past it.
+      const cr = text.indexOf('\r', p);
+      errors.push({ code: 'stray_cr', line: startLine, row: rowForErr });
+      if (parts === null) parts = [text.slice(p, cr)];
+      else parts.push(text.slice(p, cr));
+      p = cr + 1;
     }
+  }
+
+  // Junk after a closing quote, from j0, appended to prefix. Returns
+  // {value, endKind}; advances the shared cursor i and line counter.
+  function parseJunk(j0, prefix, rowForErr, startLine) {
+    let j = j0;
+    let junk = '';
+    let jEnd = 2;
+    for (;;) {
+      const comma = text.indexOf(',', j);
+      const lf = text.indexOf('\n', j);
+      let end = -1;
+      let kind = 2;
+      if (comma !== -1 && (lf === -1 || comma < lf)) {
+        end = comma;
+        kind = 0;
+      } else if (lf !== -1) {
+        end = lf;
+        kind = 1;
+      }
+      if (kind === 1 && end > j && text.charCodeAt(end - 1) === 13) {
+        const v = text.slice(j, end - 1);
+        if (v.indexOf('\r') === -1) {
+          junk += v;
+          j = end + 1;
+          line++;
+          jEnd = 1;
+          break;
+        }
+      } else if (kind !== 2) {
+        const v = text.slice(j, end);
+        if (v.indexOf('\r') === -1) {
+          junk += v;
+          j = end + 1;
+          if (kind === 1) line++;
+          jEnd = kind;
+          break;
+        }
+      } else {
+        const v = text.slice(j);
+        if (v.indexOf('\r') === -1) {
+          junk += v;
+          j = n;
+          jEnd = 2;
+          break;
+        }
+      }
+      const cr = text.indexOf('\r', j);
+      errors.push({ code: 'stray_cr', line: startLine, row: rowForErr });
+      junk += text.slice(j, cr);
+      j = cr + 1;
+    }
+    if (junk !== '') errors.push({ code: 'quote_junk', line: startLine, row: rowForErr });
+    return { value: prefix + junk, endKind: jEnd, next: j };
+  }
+
+  // Normalise one quoted segment: every CRLF or lone CR inside quotes reads
+  // as LF, and each such line break advances the line count.
+  function normaliseSeg(seg) {
+    if (seg.indexOf('\r') === -1) {
+      if (seg.indexOf('\n') !== -1) {
+        let b = 0;
+        for (let k = 0; k < seg.length; k++) if (seg.charCodeAt(k) === 10) b++;
+        line += b;
+      }
+      return seg;
+    }
+    let b = 0;
+    const out = seg.replace(/\r\n?|\n/g, () => {
+      b++;
+      return '\n';
+    });
+    line += b;
+    return out;
   }
 
   while (i < n) {
@@ -111,113 +185,151 @@ export function run(input) {
 
       if (text.charCodeAt(i) === 34) {
         // ---- quoted field ----
-        let q = i + 1;
-        const segs = [];
-        let closedAt = -1;
-        for (;;) {
-          const close = text.indexOf('"', q);
-          if (close === -1) break;
-          if (text.charCodeAt(close + 1) === 34) {
-            segs.push(text.slice(q, close));
-            segs.push('"');
-            q = close + 2;
-            continue;
-          }
-          segs.push(text.slice(q, close));
-          closedAt = close;
-          break;
-        }
-
-        if (closedAt === -1) {
+        const close = text.indexOf('"', i + 1);
+        if (close === -1) {
           // Unterminated: the opening quote is literal; the text after it is
           // read again as unquoted.
-          errors.push({ code: 'unterminated_quote', line, row: rowForErr });
-          const r = parseUnquoted(i + 1, ['"'], rowForErr);
+          errors.push({ code: 'unterminated_quote', line: startLine, row: rowForErr });
+          const r = parseUnquoted(i + 1, ['"'], rowForErr, startLine);
           value = r.value;
           endKind = r.endKind;
-        } else {
-          // Commit the segments: CR/LF inside quotes reads as LF, and every
-          // line break inside quotes advances the line count.
-          const out = [];
-          for (let s = 0; s < segs.length; s++) {
-            const seg = segs[s];
-            if (seg === '"') {
-              out.push('"');
-              continue;
-            }
-            if (seg.indexOf('\r') === -1) {
-              if (seg.indexOf('\n') !== -1) {
-                let b = 0;
-                for (let k = 0; k < seg.length; k++) if (seg.charCodeAt(k) === 10) b++;
-                line += b;
-              }
-              out.push(seg);
-            } else {
-              let b = 0;
-              out.push(seg.replace(/\r\n?|\n/g, () => {
-                b++;
-                return '\n';
-              }));
-              line += b;
-            }
+        } else if (text.charCodeAt(close + 1) !== 34) {
+          // Fast path: one segment, no doubled quotes.
+          const seg = normaliseSeg(text.slice(i + 1, close));
+          const c = text.charCodeAt(close + 1);
+          if (c === 44) {
+            value = seg;
+            i = close + 2;
+            endKind = 0;
+          } else if (c === 10) {
+            value = seg;
+            i = close + 2;
+            line++;
+            endKind = 1;
+          } else if (c === 13 && text.charCodeAt(close + 2) === 10) {
+            value = seg;
+            i = close + 3;
+            line++;
+            endKind = 1;
+          } else if (close + 1 >= n) {
+            value = seg;
+            i = n;
+            endKind = 2;
+          } else {
+            const r = parseJunk(close + 1, seg, rowForErr, startLine);
+            value = r.value;
+            i = r.next;
+            endKind = r.endKind;
           }
-
-          // Junk after the closing quote, up to the next comma or line break.
-          const junkLine = line;
-          let j = closedAt + 1;
-          let junk = '';
-          let jEnd = 2;
+        } else {
+          // Doubled quotes inside: collect segments until the close.
+          let q = close + 2;
+          const segs = [text.slice(i + 1, close), '"'];
+          let closedAt = -1;
           for (;;) {
-            const comma = text.indexOf(',', j);
-            const lf = text.indexOf('\n', j);
-            let end = -1;
-            let kind = 2;
-            if (comma !== -1 && (lf === -1 || comma < lf)) {
-              end = comma;
-              kind = 0;
-            } else if (lf !== -1) {
-              end = lf;
-              kind = 1;
-            }
-            const cr = text.indexOf('\r', j);
-            if (cr !== -1 && (end === -1 || cr < end)) {
-              if (kind === 1 && cr === end - 1) {
-                junk += text.slice(j, cr);
-                j = end + 1;
-                line++;
-                jEnd = 1;
-                break;
-              }
-              errors.push({ code: 'stray_cr', line, row: rowForErr });
-              junk += text.slice(j, cr);
-              j = cr + 1;
+            const nx = text.indexOf('"', q);
+            if (nx === -1) break;
+            if (text.charCodeAt(nx + 1) === 34) {
+              segs.push(text.slice(q, nx));
+              segs.push('"');
+              q = nx + 2;
               continue;
             }
-            if (kind === 2) {
-              junk += text.slice(j);
-              j = n;
-              jEnd = 2;
-            } else if (kind === 0) {
-              junk += text.slice(j, end);
-              j = end + 1;
-              jEnd = 0;
-            } else {
-              junk += text.slice(j, end);
-              j = end + 1;
-              line++;
-              jEnd = 1;
-            }
+            segs.push(text.slice(q, nx));
+            closedAt = nx;
             break;
           }
-          if (junk !== '') errors.push({ code: 'quote_junk', line: junkLine, row: rowForErr });
-          value = out.join('') + junk;
-          i = j;
-          endKind = jEnd;
+          if (closedAt === -1) {
+            errors.push({ code: 'unterminated_quote', line: startLine, row: rowForErr });
+            const r = parseUnquoted(i + 1, ['"'], rowForErr, startLine);
+            value = r.value;
+            endKind = r.endKind;
+          } else {
+            const out = [];
+            for (let s = 0; s < segs.length; s++) {
+              const seg = segs[s];
+              if (seg === '"') out.push('"');
+              else out.push(normaliseSeg(seg));
+            }
+            const prefix = out.join('');
+            const c = text.charCodeAt(closedAt + 1);
+            if (c === 44) {
+              value = prefix;
+              i = closedAt + 2;
+              endKind = 0;
+            } else if (c === 10) {
+              value = prefix;
+              i = closedAt + 2;
+              line++;
+              endKind = 1;
+            } else if (c === 13 && text.charCodeAt(closedAt + 2) === 10) {
+              value = prefix;
+              i = closedAt + 3;
+              line++;
+              endKind = 1;
+            } else if (closedAt + 1 >= n) {
+              value = prefix;
+              i = n;
+              endKind = 2;
+            } else {
+              const r = parseJunk(closedAt + 1, prefix, rowForErr, startLine);
+              value = r.value;
+              i = r.next;
+              endKind = r.endKind;
+            }
+          }
         }
       } else {
-        const r = parseUnquoted(i, null, rowForErr);
-        value = r.value;
-        endKind = r.endKind;
+        // ---- unquoted field (inlined hot path) ----
+        let p = i;
+        let parts = null;
+        for (;;) {
+          const comma = text.indexOf(',', p);
+          const lf = text.indexOf('\n', p);
+          let end = -1;
+          let kind = 2;
+          if (comma !== -1 && (lf === -1 || comma < lf)) {
+            end = comma;
+            kind = 0;
+          } else if (lf !== -1) {
+            end = lf;
+            kind = 1;
+          }
+          if (kind === 1 && end > p && text.charCodeAt(end - 1) === 13) {
+            const v = text.slice(p, end - 1);
+            if (v.indexOf('\r') === -1) {
+              value = parts === null ? v : parts.join('') + v;
+              i = end + 1;
+              line++;
+              endKind = 1;
+              break;
+            }
+          } else if (kind !== 2) {
+            const v = text.slice(p, end);
+            if (v.indexOf('\r') === -1) {
+              value = parts === null ? v : parts.join('') + v;
+              i = end + 1;
+              if (kind === 1) line++;
+              endKind = kind;
+              break;
+            }
+          } else {
+            const v = text.slice(p);
+            if (v.indexOf('\r') === -1) {
+              value = parts === null ? v : parts.join('') + v;
+              i = n;
+              endKind = 2;
+              break;
+            }
+          }
+          // Slow path: a stray CR sits inside the field. Drop it, report
+          // it, and keep reading the same field past it.
+          const cr = text.indexOf('\r', p);
+          errors.push({ code: 'stray_cr', line: startLine, row: rowForErr });
+          if (parts === null) parts = [text.slice(p, cr)];
+          else parts.push(text.slice(p, cr));
+          p = cr + 1;
+        }
       }
 
       fields.push(value);
